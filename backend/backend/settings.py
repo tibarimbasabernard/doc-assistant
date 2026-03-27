@@ -142,6 +142,9 @@ CORS_ALLOW_ALL_ORIGINS = False
 # Gemini API Key
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 
+# Groq API Key (fallback)
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
+
 # File upload size limit: 10MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024

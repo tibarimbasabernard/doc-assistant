@@ -1,8 +1,10 @@
 import io
+import json
 import os
 
 import pdfplumber
-import google.generativeai as genai
+from google import genai
+from groq import Groq
 from docx import Document as DocxDocument
 from django.conf import settings
 from rest_framework.views import APIView
@@ -30,11 +32,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
     return "\n".join(para.text for para in doc.paragraphs if para.text.strip())
 
 
-def analyze_with_gemini(text: str) -> dict:
-    genai.configure(api_key=settings.GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-    prompt = f"""You are a document analysis assistant. Analyze the following document text and return a JSON object with exactly these fields:
+PROMPT_TEMPLATE = """You are a document analysis assistant. Analyze the following document text and return a JSON object with exactly these fields:
 - "title": the document title (string, or "Unknown" if not found)
 - "author": the document author (string, or "Unknown" if not found)
 - "summary": a clear 3-5 sentence summary of the document (string)
@@ -43,20 +41,63 @@ def analyze_with_gemini(text: str) -> dict:
 Return ONLY valid JSON, no markdown code blocks, no extra text.
 
 Document text:
-{text[:12000]}"""
+{text}"""
 
-    response = model.generate_content(prompt)
-    raw = response.text.strip()
 
+def _sanitize_json(raw: str) -> str:
+    """Escape unescaped control characters that appear inside JSON string values."""
+    result = []
+    in_string = False
+    escape_next = False
+    _escapes = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
+    for ch in raw:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+        elif ch == '\\' and in_string:
+            result.append(ch)
+            escape_next = True
+        elif ch == '"':
+            in_string = not in_string
+            result.append(ch)
+        elif in_string and ord(ch) < 0x20:
+            result.append(_escapes.get(ch, '\\u{:04x}'.format(ord(ch))))
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+
+def _parse_json(raw: str) -> dict:
+    raw = raw.strip()
     # Strip markdown code fences if present
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
     raw = raw.strip()
-
-    import json
+    raw = _sanitize_json(raw)
     return json.loads(raw)
+
+
+def analyze_with_gemini(text: str) -> dict:
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    prompt = PROMPT_TEMPLATE.format(text=text[:12000])
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-lite",
+        contents=prompt,
+    )
+    return _parse_json(response.text)
+
+
+def analyze_with_groq(text: str) -> dict:
+    client = Groq(api_key=settings.GROQ_API_KEY)
+    prompt = PROMPT_TEMPLATE.format(text=text[:12000])
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return _parse_json(response.choices[0].message.content)
 
 
 class DocumentUploadView(APIView):
@@ -106,20 +147,43 @@ class DocumentUploadView(APIView):
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
 
-        # Analyze with Gemini
-        if not settings.GEMINI_API_KEY:
+        # Analyze — try Gemini first, fall back to Groq on quota errors
+        if not settings.GEMINI_API_KEY and not settings.GROQ_API_KEY:
             return Response(
-                {'error': 'AI service is not configured. Please set the GEMINI_API_KEY.'},
+                {'error': 'AI service is not configured. Please set GEMINI_API_KEY or GROQ_API_KEY in .env.'},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        try:
-            result = analyze_with_gemini(text)
-        except Exception as e:
-            return Response(
-                {'error': f'AI analysis failed: {str(e)}'},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
+        result = None
+
+        # Try Gemini if key is present
+        if settings.GEMINI_API_KEY:
+            try:
+                result = analyze_with_gemini(text)
+            except Exception as e:
+                err_str = str(e)
+                quota_hit = '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str
+                if not quota_hit or not settings.GROQ_API_KEY:
+                    return Response(
+                        {'error': f'AI analysis failed: {err_str}'},
+                        status=status.HTTP_502_BAD_GATEWAY,
+                    )
+                # quota hit — fall through to Groq below
+
+        # Use Groq if Gemini was skipped or hit quota
+        if result is None:
+            if not settings.GROQ_API_KEY:
+                return Response(
+                    {'error': 'Gemini quota exceeded and no Groq API key is configured.'},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            try:
+                result = analyze_with_groq(text)
+            except Exception as groq_err:
+                return Response(
+                    {'error': f'AI analysis failed (Groq): {str(groq_err)}'},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
 
         return Response({
             'filename': file.name,

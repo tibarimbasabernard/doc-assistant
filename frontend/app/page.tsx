@@ -222,7 +222,7 @@ export default function Home() {
       </main>
 
       <footer className="text-center py-8 text-sm text-slate-400 dark:text-slate-600">
-        Powered by Google Gemini API · Built with Next.js &amp; Django
+        Powered by GroQ API · Built by Bernard
       </footer>
     </div>
   );
